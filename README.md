@@ -10,6 +10,12 @@
 
 ![带底板](preview_with_bg.png)
 
+> **不想装 Python？** 直接下打包好的免安装版：
+> [**KeyOverlay.exe**](https://github.com/he283/KeyOverlay/releases/latest/download/KeyOverlay.exe)（Win10/11，单文件，自带运行时）
+>
+> ⚠️ 游戏是**以管理员身份运行**的话，这个 exe **也必须以管理员身份运行**，否则浮层看不见、按键不亮 →
+> 见「[进游戏后浮层看不见 / 按键不亮？](#进游戏后浮层看不见--按键不亮)」。
+
 ## 怎么做到的
 
 `keyoverlay.py` 里有一个小型 SVG 解析器，只做四件事：
@@ -89,7 +95,7 @@ Windows 的 UIPI（用户界面特权隔离）会在两者之间竖一道墙，�
 
 **解决：让浮层和游戏一样提权。**
 
-1. **一次性**：右键 `dist\KeyOverlay.exe` → **以管理员身份运行**。
+1. **一次性**：右键 `KeyOverlay.exe`（`dist\` 里的，或从 Releases 下的那个）→ **以管理员身份运行**。
 2. **一劳永逸**：右键 exe → 属性 → **兼容性** → 勾选 **以管理员身份运行此程序** → 确定。以后双击就是管理员。
 3. **用源码跑 `start.bat` 的**：它启动的是 `pythonw.exe`，**改 exe 的属性管不到它**，得单独处理——
    右键 `start.bat` 同样勾上兼容性里的"以管理员身份运行"（或右键 → 以管理员身份运行）。
@@ -188,14 +194,15 @@ KeyOverlay.exe --debug
 
 ## 打包成 exe
 
-**已经打好了：`dist\KeyOverlay.exe`**（约 17 MB，单文件）。它自带 Python 和 Pillow，  
-拷到任何 Win10/11 机器上双击就能用，**不需要装 Python**。
+**现成的不在这里下**——仓库里只有源码，`dist\` 是 `.gitignore` 掉的：
+去 [**Releases**](https://github.com/he283/KeyOverlay/releases/latest) 下载 `KeyOverlay.exe`（约 17 MB，单文件），
+它自带 Python 和 Pillow，拷到任何 Win10/11 机器上双击就能用，**不需要装 Python**。
 
 - 命令行参数照旧可用：`KeyOverlay.exe --scale 1.0 --pos 40,900`  
   想固定参数就建个快捷方式，在“目标”后面加上。
 - 想换设计稿：把改好的 `keyboard-mouse.svg` **放在 exe 同一个目录**，它会优先用这一份  
   （不放就用内嵌的那份）。
-- 重新打包：双击 `build_exe.bat`（会自动装 PyInstaller，约 20 秒出结果）。
+- 重新打包：双击 `build_exe.bat`（会自动装 PyInstaller，约 20 秒出结果），产物在本地 `dist\`。
 
 两个实话：
 
@@ -210,7 +217,7 @@ KeyOverlay.exe --debug
 D:\KeyOverlay
 ├─ keyoverlay.py        主程序（SVG 解析 + Pillow 栅格化 + ctypes 分层窗口）
 ├─ keyboard-mouse.svg   设计稿，程序的数据源
-├─ dist\KeyOverlay.exe  打包好的单文件版（免装 Python）
+├─ dist\KeyOverlay.exe  本地打包产物（不进仓库，发布版见 Releases）
 ├─ build_exe.bat        重新打包
 ├─ app.ico              exe / 托盘图标（多尺寸 256~16）
 ├─ app_icon_src.png     图标原图
