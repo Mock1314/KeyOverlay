@@ -1,0 +1,15 @@
+# 统一换行：仓库内存 LF，Windows 上 .bat 检出为 CRLF（否则 cmd 可能解析异常）
+* text=auto
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.py   text eol=lf
+*.md   text eol=lf
+*.svg  text eol=lf
+*.json text eol=lf
+
+# 二进制，别当文本处理
+*.png binary
+*.ico binary
+*.exe binary

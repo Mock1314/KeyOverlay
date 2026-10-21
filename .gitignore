@@ -1,0 +1,24 @@
+# --- 打包产物（由 build_exe.bat 生成；可执行文件走 GitHub Releases 分发）---
+dist/
+build/
+*.spec
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# --- 运行时产物 ---
+*.log
+keyoverlay.log
+stop_debug.txt
+
+# --- 编辑器 / 系统 ---
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
