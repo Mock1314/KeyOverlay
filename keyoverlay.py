@@ -69,7 +69,7 @@ WHEEL_DOT_R = 11.5                 # 中键按下时那个红点的半径
 
 # --- 鼠标移动方向箭头（独立叠加层，不进整帧缓存） --------------------------------
 MOVE_ARROW = (233, 223, 104, 255)   # 沿用 SVG 设计稿的黄色，和红色滚轮箭头区分开
-MOVE_CENTER = (1035.0, 575.0)      # 箭杆尾端位置，SVG 坐标（鼠标主体几何中心）
+MOVE_CENTER = (1382.0, 660.0)      # 箭杆尾端位置，SVG 坐标（鼠标主体几何中心）
 MOVE_DIRS = 16                     # 方向档位：每 22.5° 一档
 MOVE_LEN = 28.0                    # scale=1 时从中心算起的箭头长度（像素）
 MOVE_HEAD = 13.0                   # 折线头半宽（像素）
@@ -88,18 +88,26 @@ SHADOW_MARGIN = 6
 
 # 元素 id / 字形 aria-label -> 虚拟键码
 KEYMAP = {
-    "Q": 0x51, "W": 0x57, "E": 0x45,
-    "SHIFT": 0xA0, "A": 0x41, "S": 0x53, "D": 0x44,
+    "1": 0x31, "2": 0x32, "3": 0x33, "4": 0x34, "5": 0x35,
+    "TAB": 0x09,
+    "Q": 0x51, "W": 0x57, "E": 0x45, "R": 0x52, "T": 0x54,
+    "SHIFT": 0xA0, "A": 0x41, "S": 0x53, "D": 0x44, "F": 0x46, "G": 0x47,
+    "ALT": 0xA4, "Z": 0x5A, "X": 0x58, "C": 0x43, "V": 0x56, "B": 0x42,
     "CTRL": 0xA2, "SPACE": 0x20,
 }
 MOUSE_BTNS = [("LMB", 0x01), ("RMB", 0x02), ("MMB", 0x04), ("X1", 0x05), ("X2", 0x06)]
-# 右 Shift / 右 Ctrl 也映射到同一个显示名，否则按右边那颗不会亮
-ALT_VK = {"SHIFT": (0xA1,), "CTRL": (0xA3,)}
+# 右侧的 Shift / Ctrl / Alt 也映射到同一个显示名，否则按右边那颗不会亮
+ALT_VK = {"SHIFT": (0xA1,), "CTRL": (0xA3,), "ALT": (0xA5,)}
 POLL_KEYS = list(KEYMAP.items()) + [(n, v) for n, vs in ALT_VK.items() for v in vs]
 
 PRESS_BY_ID = {
-    "key-q": "Q", "key-w": "W", "key-e": "E",
-    "key-shift": "SHIFT", "key-a": "A", "key-s": "S", "key-d": "D",
+    "key-1": "1", "key-2": "2", "key-3": "3", "key-4": "4", "key-5": "5",
+    "key-tab": "TAB",
+    "key-q": "Q", "key-w": "W", "key-e": "E", "key-r": "R", "key-t": "T",
+    "key-shift": "SHIFT",
+    "key-a": "A", "key-s": "S", "key-d": "D", "key-f": "F", "key-g": "G",
+    "key-alt": "ALT",
+    "key-z": "Z", "key-x": "X", "key-c": "C", "key-v": "V", "key-b": "B",
     "key-ctrl": "CTRL", "key-space": "SPACE",
     "mouse-left": "LMB", "mouse-right": "RMB", "mouse-wheel": "MMB",
     "mouse-side-front": "X1", "mouse-side-back": "X2",
@@ -348,11 +356,19 @@ def _tile(index, k, hit, mouse_yellow=False, wheel=0):
     def tp(x, y):
         return ((x - x0) * s + pad, (y - y0) * s + pad)
 
-    for pts, closed in e["subs"]:
-        p = [tp(x, y) for x, y in pts]
-        if fill and closed:
-            d.polygon(p, fill=fill)
-        if stroke:
+    polys = [([tp(x, y) for x, y in pts], closed) for pts, closed in e["subs"]]
+    if fill:
+        # 异或合成所有子路径，保留字形内部的镂空（R 的碗、A 的三角、D 的孔…）
+        mask = Image.new("L", (W, H), 0)
+        for p, closed in polys:
+            if not closed or len(p) < 3:
+                continue
+            tmp = Image.new("L", (W, H), 0)
+            ImageDraw.Draw(tmp).polygon(p, fill=255)
+            mask = ImageChops.difference(mask, tmp)
+        im.paste(fill, (0, 0), mask)
+    if stroke:
+        for p, closed in polys:
             d.line(p + [p[0]] if closed else p, fill=stroke, width=sw, joint="curve")
 
     if rolling:
@@ -405,7 +421,7 @@ def render(pressed=(), scale=1.0, bg=False, mouse_yellow=False, move=-1):
     k = scale * SS
     pressed = key[0]
     if bg and _BODY is not None:
-        box = (0, 0, 1280, 736)
+        box = tuple(_BODY["bbox"])
     else:
         box = (BX0, BY0, BX1, BY1)
 
@@ -450,7 +466,7 @@ def render(pressed=(), scale=1.0, bg=False, mouse_yellow=False, move=-1):
 def _overlay_move(im, idx, scale, bg):
     """把方向箭头叠到已渲染好的整帧上（像素坐标，不参与帧缓存）。"""
     x, y = MOVE_CENTER
-    box = (0, 0, 1280, 736) if bg else (BX0, BY0, BX1, BY1)
+    box = tuple(_BODY["bbox"]) if bg else (BX0, BY0, BX1, BY1)
     s = ART_SCALE * scale
     off = SHADOW_MARGIN if SHADOW else 0
     # render 里的 pad 换算回最终像素：pad / SS == ART_SCALE * scale * 4
