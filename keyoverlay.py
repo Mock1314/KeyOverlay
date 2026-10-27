@@ -485,13 +485,16 @@ def _overlay_move(im, idx, scale, bg):
     tail = (cx - ux * L * 0.5, cy - uy * L * 0.5)
 
     d = ImageDraw.Draw(im)
-    d.line([tail, tip], fill=MOVE_ARROW, width=aw)
-    for sgn in (1, -1):
-        b = (tip[0] - ux * H * 0.75 + sgn * nx * H * 0.6,
-             tip[1] - uy * H * 0.75 + sgn * ny * H * 0.6)
-        d.line([b, tip], fill=MOVE_ARROW, width=aw, joint="curve")
-    d.ellipse([tip[0] - aw / 2.0, tip[1] - aw / 2.0,
-               tip[0] + aw / 2.0, tip[1] + aw / 2.0], fill=MOVE_ARROW)
+    # 箭身画到箭头底部即可，避免粗线从三角头两侧露出
+    head_len = H * 1.10
+    head_half = H * 0.55
+    base = (tip[0] - ux * head_len, tip[1] - uy * head_len)
+    d.line([tail, base], fill=MOVE_ARROW, width=aw)
+    # 箭头用实心三角，边缘锐利，放大也不糊
+    tri = [tip,
+           (base[0] + nx * head_half, base[1] + ny * head_half),
+           (base[0] - nx * head_half, base[1] - ny * head_half)]
+    d.polygon(tri, fill=MOVE_ARROW)
 
 
 def _with_shadow(im):
