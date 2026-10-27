@@ -71,8 +71,8 @@ WHEEL_DOT_R = 11.5                 # 中键按下时那个红点的半径
 MOVE_ARROW = (233, 223, 104, 255)   # 沿用 SVG 设计稿的黄色，和红色滚轮箭头区分开
 MOVE_CENTER = (1382.0, 660.0)      # 箭杆尾端位置，SVG 坐标（鼠标主体几何中心）
 MOVE_DIRS = 16                     # 方向档位：每 22.5° 一档
-MOVE_LEN = 28.0                    # scale=1 时从中心算起的箭头长度（像素）
-MOVE_HEAD = 13.0                   # 折线头半宽（像素）
+MOVE_LEN = 32.0                    # scale=1 时的箭头总长（以箭身中心为旋转点，两端各占一半）
+MOVE_HEAD = 12.0                   # 折线头尺寸（像素）
 MOVE_STROKE = 4.5                  # 箭头线宽（像素）
 MOVE_DECAY = 0.6                   # 位移平滑系数：越大越"记着"旧方向，抖动少但转向迟钝
 MOVE_MIN = 2.0                     # 平滑后的位移小于此值就当作没动（像素）
@@ -480,9 +480,9 @@ def _overlay_move(im, idx, scale, bg):
     L = MOVE_LEN * scale
     H = MOVE_HEAD * scale
     aw = max(1, int(round(MOVE_STROKE * scale)))
-    # 尾端固定在中心，箭头从中心往外指：方向变化时根部不动，视觉上更稳
-    tip = (cx + ux * L, cy + uy * L)
-    tail = (cx, cy)
+    # 箭头以自身中心为旋转点：方向变化时中点在原地转，不往外甩
+    tip = (cx + ux * L * 0.5, cy + uy * L * 0.5)
+    tail = (cx - ux * L * 0.5, cy - uy * L * 0.5)
 
     d = ImageDraw.Draw(im)
     d.line([tail, tip], fill=MOVE_ARROW, width=aw)
