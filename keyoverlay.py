@@ -66,6 +66,16 @@ WHEEL_BARB_Y = -13.0               # 折线两翼 y
 WHEEL_TAIL_Y = 31.0                # 箭杆末端 y
 WHEEL_STROKE = 6.0                 # 箭头线宽（SVG 单位）
 WHEEL_DOT_R = 11.5                 # 中键按下时那个红点的半径
+
+# --- 鼠标移动方向箭头（独立叠加层，不进整帧缓存） --------------------------------
+MOVE_ARROW = (222, 45, 38, 255)
+MOVE_CENTER = (1055.0, 595.0)      # 箭头中心，SVG 坐标（鼠标主体中央空白处；左侧被侧键占了，故右移）
+MOVE_DIRS = 16                     # 方向档位：每 22.5° 一档
+MOVE_LEN = 30.0                    # scale=1 时的箭头总长（像素）
+MOVE_HEAD = 13.0                   # 折线头半宽（像素）
+MOVE_STROKE = 4.5                  # 箭头线宽（像素）
+MOVE_DECAY = 0.6                   # 位移平滑系数：越大越"记着"旧方向，抖动少但转向迟钝
+MOVE_MIN = 2.0                     # 平滑后的位移小于此值就当作没动（像素）
 # 按下时字母保持 SVG 原本的白色，不改成深色（想反过来就把下面这行接进 _tile 的 label 分支）
 # DARK_TEXT = (26, 29, 35, 255)
 GLOW = True                # 白线外发光（对应 SVG 里那层 19% 的模糊副本）
@@ -377,11 +387,21 @@ _FRAMES = OrderedDict()
 FRAME_CACHE_MAX = 24
 
 
-def render(pressed=(), scale=1.0, bg=False, mouse_yellow=False):
+def render(pressed=(), scale=1.0, bg=False, mouse_yellow=False, move=-1):
+    """move: -1 表示不画移动箭头，0..MOVE_DIRS-1 是方向档位。
+
+    箭头做成叠加层：基础帧照旧按按键组合缓存，只在返回前复制一份再叠箭头。
+    否则 (按键组合 × 16 个方向) 会把只有 24 格的帧缓存彻底冲垮。
+    """
     key = (frozenset(pressed), round(scale, 3), bg, mouse_yellow)
     if key in _FRAMES:
         _FRAMES.move_to_end(key)
-        return _FRAMES[key]
+        im = _FRAMES[key]
+        if move < 0:
+            return im
+        out = im.copy()
+        _overlay_move(out, move, scale, bg)
+        return out
     k = scale * SS
     pressed = key[0]
     if bg and _BODY is not None:
@@ -420,7 +440,41 @@ def render(pressed=(), scale=1.0, bg=False, mouse_yellow=False):
     _FRAMES[key] = im
     while len(_FRAMES) > FRAME_CACHE_MAX:
         _FRAMES.popitem(last=False)
-    return im
+    if move < 0:
+        return im
+    out = im.copy()
+    _overlay_move(out, move, scale, bg)
+    return out
+
+
+def _overlay_move(im, idx, scale, bg):
+    """把方向箭头叠到已渲染好的整帧上（像素坐标，不参与帧缓存）。"""
+    x, y = MOVE_CENTER
+    box = (0, 0, 1280, 736) if bg else (BX0, BY0, BX1, BY1)
+    s = ART_SCALE * scale
+    off = SHADOW_MARGIN if SHADOW else 0
+    # render 里的 pad 换算回最终像素：pad / SS == ART_SCALE * scale * 4
+    pad = ART_SCALE * scale * 4.0
+    cx = off + pad + (x - box[0]) * s
+    cy = off + pad + (y - box[1]) * s
+
+    ang = math.radians(idx * (360.0 / MOVE_DIRS))
+    ux, uy = math.cos(ang), -math.sin(ang)      # 屏幕 y 轴向下，所以上行取负
+    nx, ny = -uy, ux                            # 垂直于前进方向
+    L = MOVE_LEN * scale
+    H = MOVE_HEAD * scale
+    aw = max(1, int(round(MOVE_STROKE * scale)))
+    tip = (cx + ux * L * 0.5, cy + uy * L * 0.5)
+    tail = (cx - ux * L * 0.5, cy - uy * L * 0.5)
+
+    d = ImageDraw.Draw(im)
+    d.line([tail, tip], fill=MOVE_ARROW, width=aw)
+    for sgn in (1, -1):
+        b = (tip[0] - ux * H * 0.75 + sgn * nx * H * 0.6,
+             tip[1] - uy * H * 0.75 + sgn * ny * H * 0.6)
+        d.line([b, tip], fill=MOVE_ARROW, width=aw, joint="curve")
+    d.ellipse([tip[0] - aw / 2.0, tip[1] - aw / 2.0,
+               tip[0] + aw / 2.0, tip[1] + aw / 2.0], fill=MOVE_ARROW)
 
 
 def _with_shadow(im):
@@ -585,6 +639,7 @@ user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(RAWINPUTDEVICE), ctype
 user32.RegisterRawInputDevices.restype = wintypes.BOOL
 
 _WHEEL = {"dir": 0, "t": 0.0}     # 最近一次滚动的方向与时刻
+_MOVE = {"dx": 0.0, "dy": 0.0, "t": 0.0}    # 平滑后的累计位移与最后移动时刻
 _RAW_BUF = ctypes.create_string_buffer(ctypes.sizeof(RAWINPUT))   # 复用，避免每帧分配
 
 _wndproc_ref = []
@@ -701,6 +756,12 @@ def pump():
 
 def is_down(vk):
     return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+def get_cursor():
+    pt = POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
 
 
 def _log_exc():
@@ -927,6 +988,12 @@ def main():
                     help="滚轮滚动后至少点亮多久（秒）。滚动是瞬时事件，比 --hold 长才看得清")
     ap.add_argument("--no-wheel", action="store_true",
                     help="不采集滚轮滚动（不注册 Raw Input，零开销）")
+    ap.add_argument("--move-hold", type=float, default=0.25,
+                    help="鼠标停止后方向箭头再保留多久（秒），默认 0.25")
+    ap.add_argument("--no-move", action="store_true",
+                    help="不显示鼠标移动方向箭头")
+    ap.add_argument("--move-deg", type=float, default=None,
+                    help="预览时移动箭头的角度（0=向右，90=向上，180=向左，270=向下）")
     ap.add_argument("--toggle-vk", default="0x78", help="隐藏/显示热键的虚拟键码（默认 0x78 = F9）")
     ap.add_argument("--quit-vk", default="0x79,0x7A",
                     help="退出热键的虚拟键码，可写多个（默认 0x79,0x7A = F10 或 F11；0x7A 其实是 F11）")
@@ -934,7 +1001,10 @@ def main():
 
     if args.preview:
         hit = tuple(v.strip().upper() for v in args.pressed.split(",") if v.strip())
-        im = render(pressed=hit, scale=args.scale, bg=args.bg, mouse_yellow=args.mouse_yellow)
+        mv = -1 if args.move_deg is None else \
+            int(round(args.move_deg / (360.0 / MOVE_DIRS))) % MOVE_DIRS
+        im = render(pressed=hit, scale=args.scale, bg=args.bg,
+                    mouse_yellow=args.mouse_yellow, move=mv)
         bg = Image.new("RGBA", im.size, (32, 38, 52, 255))
         bg.alpha_composite(im)
         bg.convert("RGB").save(args.preview)
@@ -991,6 +1061,12 @@ def main():
     MIN_HOLD = max(0.02, args.hold)
     WHEEL_HOLD = max(0.02, args.wheel_hold)
     POLL = max(0.002, args.poll)
+    move_on = not args.no_move
+    MOVE_HOLD = max(0.02, args.move_hold)
+    MIN_DRAW_GAP = 0.02     # 仅方向变化时至少间隔这么久再重绘（别把 6ms 轮询拖死）
+    prev_move = -1
+    last_draw = 0.0
+    last_cursor = get_cursor()
     dbg = args.debug
     dbg_f = open(os.path.join(HERE, "keyoverlay.log"), "w", encoding="utf-8") if dbg else None
     toggle_vk = int(args.toggle_vk, 0)
@@ -1007,6 +1083,20 @@ def main():
             if h_event and kernel32.WaitForSingleObject(h_event, 0) == 0:
                 break
             now = time.time()
+            cur = get_cursor()
+            mdx, mdy = cur[0] - last_cursor[0], cur[1] - last_cursor[1]
+            last_cursor = cur
+            if mdx or mdy:
+                # 指数平滑：单次采样当方向会让手抖带着箭头乱摆
+                _MOVE["dx"] = _MOVE["dx"] * MOVE_DECAY + mdx
+                _MOVE["dy"] = _MOVE["dy"] * MOVE_DECAY + mdy
+                _MOVE["t"] = now
+            move = -1
+            if move_on and now - _MOVE["t"] < MOVE_HOLD and \
+                    abs(_MOVE["dx"]) + abs(_MOVE["dy"]) >= MOVE_MIN:
+                deg = math.degrees(math.atan2(-_MOVE["dy"], _MOVE["dx"]))
+                move = int(round(deg / (360.0 / MOVE_DIRS))) % MOVE_DIRS
+
             down = {n for n, vk in POLL_KEYS if is_down(vk)}
             down |= {b[0] for b in MOUSE_BTNS if is_down(b[1])}
             for n in down:
@@ -1014,14 +1104,17 @@ def main():
             state = frozenset(n for n, t in last_seen.items() if now - t < MIN_HOLD)
             if wheel_on and now - _WHEEL["t"] < WHEEL_HOLD:
                 state = state | {"WHEEL_UP" if _WHEEL["dir"] > 0 else "WHEEL_DOWN"}
-            if state != prev_state:
-                if dbg_f:
+
+            changed = state != prev_state
+            # 按键变化立即响应；只有方向变了才受最小间隔约束
+            if changed or (move != prev_move and now - last_draw >= MIN_DRAW_GAP):
+                if dbg_f and changed:
                     dbg_f.write("%.3f %s\n" % (now, ",".join(sorted(state)) or "-"))
                     dbg_f.flush()
                 if visible:
                     try:
-                        img = render(pressed=state, scale=args.scale,
-                                     bg=args.bg, mouse_yellow=args.mouse_yellow)
+                        img = render(pressed=state, scale=args.scale, bg=args.bg,
+                                     mouse_yellow=args.mouse_yellow, move=move)
                     except Exception:
                         _log_exc()
                         img = None
@@ -1032,6 +1125,8 @@ def main():
                                                 SWP_NOZORDER | SWP_NOACTIVATE)
                         blit(hwnd, img, x, y)
                 prev_state = state
+                prev_move = move
+                last_draw = now
 
             if CMD["quit"]:
                 CMD["quit"] = False
