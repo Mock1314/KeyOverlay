@@ -14,6 +14,9 @@ transform 矩阵），再用 Pillow 逐元素栅格化。因此形状、圆角�
     python keyoverlay.py --mouse-yellow  # 鼠标左右键常亮黄色（不带按下反馈）
     python keyoverlay.py --solid         # 取消点击穿透
     python keyoverlay.py --preview out.png [--pressed W,LMB]
+    python keyoverlay.py --preview out.png --pressed WHEEL_UP   # 预览滚轮上滚（WHEEL_DOWN 同理）
+    python keyoverlay.py --no-wheel      # 不采集滚轮（不注册 Raw Input）
+    python keyoverlay.py --wheel-hold 0.15
     python keyoverlay.py --toggle-vk 0x78 --quit-vk 0x79
 
 运行中：F9 隐藏/显示，F10 退出。
@@ -55,6 +58,13 @@ SVG_FILE = _resource("keyboard-mouse.svg")
 SS = 4                     # 超采样倍数
 ART_SCALE = 0.34           # SVG 单位 -> scale=1 时的像素
 HILITE = (233, 223, 104, 255)      # 按下填充（取自 SVG 黄色渐变中间色）
+WHEEL_ARROW = (222, 45, 38, 255)    # 滚轮滚动方向箭头：黄底上用红色
+# 方向箭头几何（相对滚轮胶囊中心的 SVG 单位，向上版本；向下时 y 取反）
+WHEEL_HEAD_DX = 16.0               # 折线头单侧半宽
+WHEEL_HEAD_Y = -31.0               # 尖端 y
+WHEEL_BARB_Y = -13.0               # 折线两翼 y
+WHEEL_TAIL_Y = 31.0                # 箭杆末端 y
+WHEEL_STROKE = 6.0                 # 箭头线宽（SVG 单位）
 # 按下时字母保持 SVG 原本的白色，不改成深色（想反过来就把下面这行接进 _tile 的 label 分支）
 # DARK_TEXT = (26, 29, 35, 255)
 GLOW = True                # 白线外发光（对应 SVG 里那层 19% 的模糊副本）
@@ -296,9 +306,13 @@ _TILES = {}
 
 
 # ============================ 栅格化 ============================
-def _tile(index, k, hit, mouse_yellow=False):
-    """把单个元素渲染成小图（带缓存）。返回 (图, 左上角坐标)。"""
-    key = (index, round(k, 4), hit, mouse_yellow)
+def _tile(index, k, hit, mouse_yellow=False, wheel=0):
+    """把单个元素渲染成小图（带缓存）。返回 (图, 左上角坐标)。
+
+    wheel: 1=向上滚、-1=向下滚、0=没滚。只有滚轮元素会用到，其余元素恒传 0，
+    否则同一张键帽会因为滚动方向不同被缓存成十几份。
+    """
+    key = (index, round(k, 4), hit, mouse_yellow, wheel)
     if key in _TILES:
         return _TILES[key]
 
@@ -313,18 +327,37 @@ def _tile(index, k, hit, mouse_yellow=False):
     d = ImageDraw.Draw(im)
 
     fill, stroke = e["fill"], e["stroke"]
+    rolling = e["id"] == "mouse-wheel" and wheel
     if e["yellow"]:
         fill = HILITE if (hit or mouse_yellow) else None
-    elif hit and not e["label"]:
+    elif (hit or rolling) and not e["label"]:
         # 只有键帽（轮廓）变黄，字母保持原本的白色
         fill = HILITE
 
+    def tp(x, y):
+        return ((x - x0) * s + pad, (y - y0) * s + pad)
+
     for pts, closed in e["subs"]:
-        p = [((x - x0) * s + pad, (y - y0) * s + pad) for x, y in pts]
+        p = [tp(x, y) for x, y in pts]
         if fill and closed:
             d.polygon(p, fill=fill)
         if stroke:
             d.line(p + [p[0]] if closed else p, fill=stroke, width=sw, joint="curve")
+
+    if rolling:
+        # 方向箭头：黄底上挖一个深色箭头，向上滚指上、向下滚指下（y 轴镜像）
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        sign = -1.0 if wheel < 0 else 1.0
+        aw = max(1, int(round(WHEEL_STROKE * s)))
+        tip = tp(cx, cy + sign * WHEEL_HEAD_Y)
+        d.line([tp(cx, cy + sign * WHEEL_TAIL_Y), tip],
+               fill=WHEEL_ARROW, width=aw)
+        d.line([tp(cx - WHEEL_HEAD_DX, cy + sign * WHEEL_BARB_Y), tip,
+                tp(cx + WHEEL_HEAD_DX, cy + sign * WHEEL_BARB_Y)],
+               fill=WHEEL_ARROW, width=aw, joint="curve")
+        d.ellipse([tip[0] - aw / 2.0, tip[1] - aw / 2.0,
+                   tip[0] + aw / 2.0, tip[1] + aw / 2.0], fill=WHEEL_ARROW)
 
     pos = (int(round(x0 * s)) - pad, int(round(y0 * s)) - pad)
     _TILES[key] = (im, pos)
@@ -353,11 +386,13 @@ def render(pressed=(), scale=1.0, bg=False, mouse_yellow=False):
     im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     ox, oy = pad - int(round(box[0] * ART_SCALE * k)), pad - int(round(box[1] * ART_SCALE * k))
 
+    wheel = 1 if "WHEEL_UP" in pressed else (-1 if "WHEEL_DOWN" in pressed else 0)
     order = ([ART.index(_BODY)] if (bg and _BODY) else []) + \
             [i for i, e in enumerate(ART) if e["id"] != "background"]
     for i in order:
         e = ART[i]
-        tile, pos = _tile(i, k, e["press"] in pressed, mouse_yellow)
+        tile, pos = _tile(i, k, e["press"] in pressed, mouse_yellow,
+                          wheel if e["id"] == "mouse-wheel" else 0)
         im.alpha_composite(tile, (pos[0] + ox, pos[1] + oy))
 
     im = im.resize((max(1, round(im.width / SS)), max(1, round(im.height / SS))),
@@ -408,6 +443,14 @@ WS_EX_NOACTIVATE = 0x08000000
 WS_POPUP = 0x80000000
 SW_SHOWNOACTIVATE = 4
 ULW_ALPHA = 2
+
+# --- Raw Input：只读一份滚轮事件，不装钩子、不注入按键 -------------------------
+WM_INPUT = 0x00FF
+RID_INPUT = 0x10000003
+RIM_TYPEMOUSE = 0
+RI_MOUSE_WHEEL = 0x0400
+RIDEV_INPUTSINK = 0x00000100   # 浮层永不激活，没有它一个滚轮事件都收不到
+
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
@@ -503,10 +546,51 @@ gdi32.CreateDIBSection.restype = wintypes.HBITMAP
 gdi32.CreateDIBSection.argtypes = [wintypes.HDC, ctypes.c_void_p, ctypes.c_uint,
                                    ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, ctypes.c_uint]
 
+class RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [("usUsagePage", ctypes.c_ushort), ("usUsage", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong), ("hwndTarget", wintypes.HWND)]
+
+
+class RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [("dwType", ctypes.c_ulong), ("dwSize", ctypes.c_ulong),
+                ("hDevice", ctypes.c_void_p), ("wParam", ctypes.c_void_p)]
+
+
+class RAWMOUSE(ctypes.Structure):
+    # usFlags 后必须有 2 字节填充：C 里那个 union 是 ULONG，直接写两个 ushort 会整体错位
+    _fields_ = [("usFlags", ctypes.c_ushort), ("_pad", ctypes.c_ushort),
+                ("usButtonFlags", ctypes.c_ushort), ("usButtonData", ctypes.c_short),
+                ("ulRawButtons", ctypes.c_ulong), ("lLastX", ctypes.c_long),
+                ("lLastY", ctypes.c_long), ("ulExtraInformation", ctypes.c_ulong)]
+
+
+class RAWINPUT(ctypes.Structure):
+    _fields_ = [("header", RAWINPUTHEADER), ("mouse", RAWMOUSE)]
+
+
+user32.GetRawInputData.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
+                                   ctypes.POINTER(ctypes.c_uint), ctypes.c_uint]
+user32.GetRawInputData.restype = ctypes.c_uint
+user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(RAWINPUTDEVICE), ctypes.c_uint,
+                                           ctypes.c_uint]
+user32.RegisterRawInputDevices.restype = wintypes.BOOL
+
+_WHEEL = {"dir": 0, "t": 0.0}     # 最近一次滚动的方向与时刻
+_RAW_BUF = ctypes.create_string_buffer(ctypes.sizeof(RAWINPUT))   # 复用，避免每帧分配
+
 _wndproc_ref = []
 
 
 def _wndproc(hwnd, msg, wparam, lparam):
+    if msg == WM_INPUT:        # 原始输入：只挑滚轮，鼠标移动直接放过
+        size = ctypes.c_uint(ctypes.sizeof(RAWINPUT))
+        if user32.GetRawInputData(ctypes.c_void_p(lparam), RID_INPUT, _RAW_BUF,
+                                  ctypes.byref(size), ctypes.sizeof(RAWINPUTHEADER)):
+            ri = RAWINPUT.from_buffer_copy(_RAW_BUF)
+            if ri.header.dwType == RIM_TYPEMOUSE and (ri.mouse.usButtonFlags & RI_MOUSE_WHEEL):
+                _WHEEL["dir"] = 1 if ri.mouse.usButtonData > 0 else -1
+                _WHEEL["t"] = time.time()
+        return 0
     if msg == 0x0010:          # WM_CLOSE：别人（stop.py / 任务栏）要求关闭
         user32.DestroyWindow(hwnd)
         return 0
@@ -538,6 +622,13 @@ def create_window(w, h, x, y, clickthrough=True):
                                   x, y, w, h, None, None, hinst, None)
     user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
     return hwnd
+
+
+def enable_wheel(hwnd):
+    """注册原始输入（只读一份，不拦截）。失败就静默降级，不亮而已，不影响其他功能。"""
+    rid = RAWINPUTDEVICE(0x01, 0x02, RIDEV_INPUTSINK, hwnd)
+    return bool(user32.RegisterRawInputDevices(ctypes.byref(rid), 1,
+                                               ctypes.sizeof(RAWINPUTDEVICE)))
 
 
 _DIB = {}          # (w, h) -> (hdc_mem, hbmp, bits)  复用，避免每帧 CreateDIBSection
@@ -823,6 +914,10 @@ def main():
     ap.add_argument("--debug", action="store_true", help="把状态变化写进 keyoverlay.log，排查连点用")
     ap.add_argument("--poll", type=float, default=0.006,
                     help="轮询间隔（秒），默认 0.006")
+    ap.add_argument("--wheel-hold", type=float, default=0.15,
+                    help="滚轮滚动后至少点亮多久（秒）。滚动是瞬时事件，比 --hold 长才看得清")
+    ap.add_argument("--no-wheel", action="store_true",
+                    help="不采集滚轮滚动（不注册 Raw Input，零开销）")
     ap.add_argument("--toggle-vk", default="0x78", help="隐藏/显示热键的虚拟键码（默认 0x78 = F9）")
     ap.add_argument("--quit-vk", default="0x79,0x7A",
                     help="退出热键的虚拟键码，可写多个（默认 0x79,0x7A = F10 或 F11；0x7A 其实是 F11）")
@@ -869,6 +964,8 @@ def main():
         print("创建窗口失败，错误码:", ctypes.get_last_error())
         return 1
 
+    wheel_on = False if args.no_wheel else enable_wheel(hwnd)
+
     blit(hwnd, img, x, y)
 
     # 托盘图标：单击显示/隐藏，右键出菜单
@@ -883,6 +980,7 @@ def main():
     last_top = 0.0
     last_seen = {}          # 名称 -> 最后按下的时刻，实现最短显示时长
     MIN_HOLD = max(0.02, args.hold)
+    WHEEL_HOLD = max(0.02, args.wheel_hold)
     POLL = max(0.002, args.poll)
     dbg = args.debug
     dbg_f = open(os.path.join(HERE, "keyoverlay.log"), "w", encoding="utf-8") if dbg else None
@@ -891,6 +989,7 @@ def main():
     prev_f9 = prev_f10 = False
     visible = True
     print("已启动：%dx%d @ (%d,%d)   F9 隐藏/显示，F10 退出" % (w, h, x, y))
+    print("滚轮反馈：%s" % ("已启用（Raw Input 只读，不拦截）" if wheel_on else "未启用"))
 
     try:
         while True:
@@ -904,6 +1003,8 @@ def main():
             for n in down:
                 last_seen[n] = now
             state = frozenset(n for n, t in last_seen.items() if now - t < MIN_HOLD)
+            if wheel_on and now - _WHEEL["t"] < WHEEL_HOLD:
+                state = state | {"WHEEL_UP" if _WHEEL["dir"] > 0 else "WHEEL_DOWN"}
             if state != prev_state:
                 if dbg_f:
                     dbg_f.write("%.3f %s\n" % (now, ",".join(sorted(state)) or "-"))
