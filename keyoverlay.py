@@ -65,6 +65,7 @@ WHEEL_HEAD_Y = -31.0               # 尖端 y
 WHEEL_BARB_Y = -13.0               # 折线两翼 y
 WHEEL_TAIL_Y = 31.0                # 箭杆末端 y
 WHEEL_STROKE = 6.0                 # 箭头线宽（SVG 单位）
+WHEEL_DOT_R = 11.5                 # 中键按下时那个红点的半径
 # 按下时字母保持 SVG 原本的白色，不改成深色（想反过来就把下面这行接进 _tile 的 label 分支）
 # DARK_TEXT = (26, 29, 35, 255)
 GLOW = True                # 白线外发光（对应 SVG 里那层 19% 的模糊副本）
@@ -345,7 +346,7 @@ def _tile(index, k, hit, mouse_yellow=False, wheel=0):
             d.line(p + [p[0]] if closed else p, fill=stroke, width=sw, joint="curve")
 
     if rolling:
-        # 方向箭头：黄底上挖一个深色箭头，向上滚指上、向下滚指下（y 轴镜像）
+        # 滚动方向箭头：黄底上画红色箭头，向上滚指上、向下滚指下（y 轴镜像）
         cx = (x0 + x1) / 2.0
         cy = (y0 + y1) / 2.0
         sign = -1.0 if wheel < 0 else 1.0
@@ -358,6 +359,14 @@ def _tile(index, k, hit, mouse_yellow=False, wheel=0):
                fill=WHEEL_ARROW, width=aw, joint="curve")
         d.ellipse([tip[0] - aw / 2.0, tip[1] - aw / 2.0,
                    tip[0] + aw / 2.0, tip[1] + aw / 2.0], fill=WHEEL_ARROW)
+    elif e["id"] == "mouse-wheel" and hit:
+        # 中键按下：居中一颗红点，和滚动的"带方向箭头"区分开。
+        # 滚动优先——按着中键同时滚时只画箭头，方向信息更有用。
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        r = WHEEL_DOT_R * s
+        c = tp(cx, cy)
+        d.ellipse([c[0] - r, c[1] - r, c[0] + r, c[1] + r], fill=WHEEL_ARROW)
 
     pos = (int(round(x0 * s)) - pad, int(round(y0 * s)) - pad)
     _TILES[key] = (im, pos)
