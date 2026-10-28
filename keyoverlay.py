@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from ctypes import wintypes
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 # 打包成 exe（PyInstaller）后：__file__ 指向临时解包目录，exe 实际在 sys.executable 旁边。
 # HERE 用来放日志等"要留得住"的文件；_RES 用来找打包进去的只读资源。
@@ -53,6 +53,12 @@ def _resource(name):
 
 
 SVG_FILE = _resource("keyboard-mouse.svg")
+# 两套布局：classic 是上游原版 9 键，extended 是后来扩的 25 键。切换时只换 SVG 源。
+LAYOUT_FILES = {
+    "classic": _resource("keyboard-mouse-classic.svg"),
+    "extended": _resource("keyboard-mouse.svg"),
+}
+LAYOUT_NAMES = {"classic": "经典布局", "extended": "扩展布局"}
 
 # ============================ 外观参数 ============================
 SS = 4                     # 超采样倍数
@@ -69,7 +75,8 @@ WHEEL_DOT_R = 11.5                 # 中键按下时那个红点的半径
 
 # --- 鼠标移动方向箭头（独立叠加层，不进整帧缓存） --------------------------------
 MOVE_ARROW = (233, 223, 104, 255)   # 沿用 SVG 设计稿的黄色，和红色滚轮箭头区分开
-MOVE_CENTER = (1382.0, 660.0)      # 箭杆尾端位置，SVG 坐标（鼠标主体几何中心）
+MOVE_CENTER = (1382.0, 660.0)      # 箭头旋转中心，SVG 坐标。启动后按 mouse-body 的 bbox 重算，
+                                   # 换布局时自动跟着走，不用手改（写死的值只作兜底）
 MOVE_DIRS = 16                     # 方向档位：每 22.5° 一档
 MOVE_LEN = 32.0                    # scale=1 时的箭头总长（以箭身中心为旋转点，两端各占一半）
 MOVE_HEAD = 12.0                   # 折线头尺寸（像素）
@@ -320,6 +327,18 @@ BX0 = min(e["bbox"][0] for e in _CONTENT)
 BY0 = min(e["bbox"][1] for e in _CONTENT)
 BX1 = max(e["bbox"][2] for e in _CONTENT)
 BY1 = max(e["bbox"][3] for e in _CONTENT)
+
+
+def compute_move_center():
+    """箭头中心 = 鼠标主体的几何中心。换布局时鼠标位置会变，所以不能写死。"""
+    for e in ART:
+        if e.get("id") == "mouse-body":
+            b = e["bbox"]
+            return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+    return MOVE_CENTER
+
+
+MOVE_CENTER = compute_move_center()
 
 _TILES = {}
 
@@ -604,6 +623,9 @@ user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 user32.GetDC.restype = wintypes.HDC
 user32.GetDC.argtypes = [wintypes.HWND]
 user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+gdi32.GetDeviceCaps.argtypes = [wintypes.HDC, ctypes.c_int]
+user32.SetCapture.argtypes = [wintypes.HWND]
+user32.ReleaseCapture.argtypes = []
 user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
                                 ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
 user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
@@ -808,17 +830,34 @@ NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
 MF_STRING, MF_SEPARATOR, MF_CHECKED, MF_POPUP = 0x0000, 0x0800, 0x0008, 0x0010
 TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_NONOTIFY = 0x0100, 0x0002, 0x0080
-ID_TOGGLE, ID_RELOAD, ID_QUIT = 1001, 1002, 1003
+ID_TOGGLE, ID_RELOAD, ID_QUIT, ID_PANEL = 1001, 1002, 1003, 1004
 ID_POS_BASE, ID_MON_BASE = 1100, 1120     # 九宫格格位 1100..1108，显示器 1120..112F
 
-CMD = {"toggle": False, "reload": False, "quit": False, "anchor": False}
-_TRAY = {"hwnd": None, "hicon": None, "icon": None, "on": False, "visible": True}
+CMD = {"toggle": False, "reload": False, "quit": False, "anchor": False,
+       "panel": False, "repaint": False}
+_TRAY = {"hwnd": None, "hicon": None, "icon": None, "on": False, "visible": True,
+         "click_t": 0.0}
 
-# 浮层位置状态：cell 是九宫格格位（0..8，按行优先），mon 是显示器序号（0 = 主屏）
-_POS = {"cell": 6, "mon": 0}              # 6 = 左下，与原默认一致
+# 全局生效中的配置：命令行的默认值、ini 里存的值、控制面板里改的值，最后都落到这张表，
+# 主循环每帧从这里读，所以面板改完不用重启。
+CFG = {
+    "layout": "extended",      # classic | extended
+    "scale": 1.2,
+    "cell": 6, "mon": 0, "margin": 40,     # cell: 九宫格格位，6 = 左下
+    "bg": False,               # 画 SVG 的深色底板
+    "mouse_yellow": False,     # 鼠标左右键常亮
+    "solid": False,            # True = 取消点击穿透
+    "hold": 0.03,              # 按下后至少点亮多久
+    "wheel_on": True, "wheel_hold": 0.15,
+    "move_on": True, "move_hold": 0.25,
+    "pinned": False,           # True = 用 --pos 钉死位置，重绘后不再按格位回位
+}
+CFG_DEFAULTS = dict(CFG)
+_POS = CFG                     # 旧代码里的 _POS[...] 继续可用（cell / mon 就在这张表里）
 CELL_NAMES = ("↖ 左上", "↑ 上中", "↗ 右上",
               "← 左中", "● 居中", "→ 右中",
               "↙ 左下", "↓ 下中", "↘ 右下")
+CELL_SHORT = ("左上", "上中", "右上", "左中", "居中", "右中", "左下", "下中", "右下")
 CFG_FILE = os.path.join(HERE, "keyoverlay.ini")
 
 
@@ -874,27 +913,62 @@ def anchor_xy(cell, cw, ch, screen, margin):
     return int(sx + dx), int(sy + dy)
 
 
+CFG_KEYS = ("layout", "scale", "cell", "mon", "margin", "bg", "mouse_yellow",
+            "solid", "hold", "wheel_on", "wheel_hold", "move_on", "move_hold")
+
+
+def _cfg_cast(key, raw):
+    """按默认值的类型解析 ini 里的字符串，坏值一律丢弃。"""
+    d = CFG_DEFAULTS[key]
+    raw = raw.strip()
+    if isinstance(d, bool):
+        return raw not in ("0", "false", "False", "no", "")
+    if isinstance(d, int):
+        return int(float(raw))
+    if isinstance(d, float):
+        return float(raw)
+    return raw if raw in LAYOUT_FILES else d
+
+
 def cfg_load():
-    """读 keyoverlay.ini；文件不存在或读坏了就用默认值。"""
+    """读 keyoverlay.ini；文件不存在、缺项、值坏了都退回默认值。"""
     try:
         with open(CFG_FILE, "r", encoding="utf-8") as f:
             for line in f:
                 k, sep, v = line.partition("=")
                 k = k.strip().lower()
-                if sep and k in _POS:
-                    _POS[k] = int(v.strip())
+                if sep and k in CFG_DEFAULTS:
+                    try:
+                        CFG[k] = _cfg_cast(k, v)
+                    except (ValueError, TypeError):
+                        pass
     except Exception:
         pass
-    _POS["cell"] = max(0, min(8, int(_POS.get("cell", 6))))
-    _POS["mon"] = max(0, int(_POS.get("mon", 0)))
-    return _POS
+    cfg_clamp()
+    return CFG
+
+
+def cfg_clamp():
+    """把数值限制在安全范围里，免得手改 ini 写出一个点不亮的值。"""
+    CFG["layout"] = CFG["layout"] if CFG["layout"] in LAYOUT_FILES else "extended"
+    CFG["scale"] = max(0.5, min(3.0, float(CFG["scale"])))
+    CFG["cell"] = max(0, min(8, int(CFG["cell"])))
+    CFG["mon"] = max(0, int(CFG["mon"]))
+    CFG["margin"] = max(0, min(400, int(CFG["margin"])))
+    CFG["hold"] = max(0.02, min(0.5, float(CFG["hold"])))
+    CFG["wheel_hold"] = max(0.05, min(1.5, float(CFG["wheel_hold"])))
+    CFG["move_hold"] = max(0.05, min(1.5, float(CFG["move_hold"])))
 
 
 def cfg_save():
     try:
         with open(CFG_FILE, "w", encoding="utf-8") as f:
-            f.write("# KeyOverlay 设置（托盘菜单里改，一般不用手改）\n")
-            f.write("cell=%d\nmon=%d\n" % (_POS["cell"], _POS["mon"]))
+            f.write("# KeyOverlay 设置（控制面板或托盘菜单里改，一般不用手改）\n")
+            for k in CFG_KEYS:
+                v = CFG[k]
+                if isinstance(v, bool):
+                    v = 1 if v else 0
+                f.write("%s=%s\n" % (k, v))
     except Exception:
         pass          # 放在只读目录时就不记了，不影响使用
 
@@ -1004,6 +1078,7 @@ def _build_menu():
     user32.AppendMenuW(menu, MF_STRING, ID_TOGGLE,
                        "隐藏浮层" if _TRAY["visible"] else "显示浮层")
     user32.AppendMenuW(menu, MF_STRING, ID_RELOAD, "重新加载设计稿 (svg)")
+    user32.AppendMenuW(menu, MF_STRING, ID_PANEL, "控制面板…")
     user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
 
     # --- 浮层位置：九宫格 + （多屏时）显示器选择 ---
@@ -1037,6 +1112,8 @@ def _menu_cmd(cmd):
         CMD["toggle"] = True
     elif cmd == ID_RELOAD:
         CMD["reload"] = True
+    elif cmd == ID_PANEL:
+        CMD["panel"] = True
     elif cmd == ID_QUIT:
         CMD["quit"] = True
     elif ID_POS_BASE <= cmd < ID_POS_BASE + 9:
@@ -1068,8 +1145,14 @@ def _tray_wndproc(hwnd, msg, wparam, lparam):
     if msg == TRAY_MSG:
         if lparam in (WM_RBUTTONUP, WM_CONTEXTMENU):
             show_tray_menu(hwnd)
-        elif lparam in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
-            CMD["toggle"] = True
+        elif lparam == WM_LBUTTONDBLCLK:
+            # 双击开控制面板；顺手把单击计时清掉，别让双击再顺带切一次显隐
+            _TRAY["click_t"] = 0.0
+            _TRAY["skip_until"] = time.time() + 0.45
+            CMD["panel"] = True
+        elif lparam == WM_LBUTTONUP:
+            if time.time() >= _TRAY.get("skip_until", 0.0):
+                _TRAY["click_t"] = time.time()
         return 0
     if msg == WM_COMMAND:
         _menu_cmd(wparam & 0xFFFF)
@@ -1095,9 +1178,16 @@ def create_tray_window():
     return hwnd
 
 
-def reload_art():
-    """重新解析 SVG 并清空贴片/帧缓存（托盘菜单里的"重新加载设计稿"）。"""
-    global ART, _BODY, _CONTENT, BX0, BY0, BX1, BY1
+def reload_art(layout=None):
+    """重新解析 SVG 并清空贴片/帧缓存。
+
+    layout 给 None 表示"照当前文件重读"（托盘里的重新加载设计稿）；
+    给 "classic"/"extended" 表示切换布局。
+    """
+    global ART, _BODY, _CONTENT, BX0, BY0, BX1, BY1, SVG_FILE, MOVE_CENTER
+    if layout in LAYOUT_FILES:
+        CFG["layout"] = layout
+        SVG_FILE = LAYOUT_FILES[layout]
     ART = load_svg(SVG_FILE)
     _BODY = next((e for e in ART if e["id"] == "background"), None)
     _CONTENT = [e for e in ART if e["id"] != "background"]
@@ -1105,34 +1195,516 @@ def reload_art():
     BY0 = min(e["bbox"][1] for e in _CONTENT)
     BX1 = max(e["bbox"][2] for e in _CONTENT)
     BY1 = max(e["bbox"][3] for e in _CONTENT)
+    MOVE_CENTER = compute_move_center()
     _TILES.clear()
     _FRAMES.clear()
+
+
+# ============================ 控制面板 ============================
+# 自绘面板：Pillow 画好整张图 -> UpdateLayeredWindow 贴上去，点击靠一张矩形命中表。
+# 控件只有四种原语（单选行 / 分段按钮 / 步进器 / 开关），全是矩形，不需要拖拽。
+PANEL_CLASS = "KeyMouseOverlayPanel"
+PANEL_W = 420          # 逻辑宽度（px @100%）
+PANEL_PAD = 14         # 阴影留白
+PANEL_SS = 3           # 绘制超采样倍数，缩小后有抗锯齿效果
+WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE = 0x0201, 0x0202, 0x0200
+
+PANEL = {"hwnd": None, "visible": False, "pos": (0, 0), "scale": 1.0,
+         "hits": [], "drag": None, "items_h": 0}
+
+# 面板配色：仿 Win11 浅色，跟浮层那套深色是两回事
+PC = {
+    "bg": (243, 243, 243, 255),
+    "titlebar": (250, 250, 250, 255),
+    "card": (251, 251, 251, 255),
+    "border": (214, 214, 214, 255),
+    "line": (233, 233, 233, 255),
+    "text": (27, 27, 27, 255),
+    "sub": (107, 107, 107, 255),
+    "hint": (126, 126, 126, 255),
+    "accent": (0, 103, 192, 255),
+    "accent_bg": (232, 242, 252, 255),
+    "white": (255, 255, 255, 255),
+    "off": (198, 198, 198, 255),
+    "danger": (179, 38, 30, 255),
+    "ok": (46, 158, 91, 255),
+    "btn": (253, 253, 253, 255),
+    "btn_line": (203, 203, 203, 255),
+}
+
+_FONTS = {}
+
+
+def pfont(size, bold=False):
+    """微软雅黑足够接近 Segoe UI 的中文观感；找不到就退回默认位图字体。"""
+    key = (size, bold)
+    if key in _FONTS:
+        return _FONTS[key]
+    f = None
+    for name in (("msyhbd.ttc", "msyh.ttc", "segoeuib.ttf") if bold
+                 else ("msyh.ttc", "segoeui.ttf", "simhei.ttf")):
+        try:
+            f = ImageFont.truetype("C:/Windows/Fonts/" + name, size)
+            break
+        except Exception:
+            continue
+    if f is None:
+        f = ImageFont.load_default()
+    _FONTS[key] = f
+    return f
+
+
+def panel_layout():
+    """把面板排一遍，返回 (绘制指令, 总高度, 命中表)。坐标都是逻辑像素。
+
+    排完再画，而不是边画边算——这样高度是已知的，能一次开好画布。
+    """
+    W, PAD = PANEL_W, 16
+    it, hits = [], []
+
+    def rect(x0, y0, x1, y1, r=0, fill=None, outline=None, w=1):
+        it.append(("rect", (x0, y0, x1, y1), r, fill, outline, w))
+
+    def ell(x0, y0, x1, y1, fill=None, outline=None, w=1):
+        it.append(("ellipse", (x0, y0, x1, y1), fill, outline, w))
+
+    def txt(x, y, s, size=13, bold=False, fill=None, anchor="la"):
+        it.append(("text", (x, y), s, size, bold, fill or PC["text"], anchor))
+
+    def line(x0, y0, x1, y1, fill=None, w=1):
+        it.append(("line", (x0, y0, x1, y1), fill or PC["line"], w))
+
+    def hit(x0, y0, x1, y1, act, arg=None):
+        hits.append((x0, y0, x1, y1, act, arg))
+
+    # --- 标题栏（整条可拖动，右侧关闭）---
+    # 先铺一张足够高的底色，最后会被圆角蒙版裁到真实高度
+    rect(0, 0, W, 3000, fill=PC["bg"])
+    rect(0, 0, W, 32, fill=PC["titlebar"])
+    line(0, 31.5, W, 31.5)
+    # 图标：圆角蓝底 + 六个白色小键帽，比直接贴深色 app.ico 更搭浅色标题栏
+    rect(11, 9, 25, 23, r=4, fill=PC["accent"])
+    for _r in range(2):
+        for _c in range(3):
+            _x = 12.7 + _c * 3.8
+            _y = 13.0 + _r * 3.4
+            rect(_x, _y, _x + 3, _y + 2.6, r=0.8, fill=(255, 255, 255, 240))
+    txt(30, 16, "KeyOverlay 控制面板", 12, False, PC["sub"], "lm")
+    hit(0, 0, W - 34, 32, "drag")
+    hit(W - 34, 0, W, 32, "close")
+    txt(W - 17, 16, "×", 16, False, PC["sub"], "mm")
+
+    # --- 大标题 ---
+    y = 32 + 14
+    txt(PAD, y, "KeyOverlay 控制面板", 16, True)
+    y += 23
+    txt(PAD, y, "切换显示方案与反馈细节，改动立即生效", 12, False, PC["sub"])
+    y += 17 + 13
+
+    # --- 按键布局 ---
+    txt(PAD, y, "按键布局", 11, False, PC["hint"])
+    y += 15 + 6
+    card1 = y
+    rect(PAD, card1, W - PAD, card1 + 94, r=6, fill=PC["card"], outline=PC["border"])
+    for i, (key, name, desc) in enumerate((
+            ("classic", "经典布局", "Q W E · Shift A S D · Ctrl 空格"),
+            ("extended", "扩展布局", "1-5 · Tab · Q-T · A-G · Z-B · Alt"))):
+        ry = card1 + 5 + i * 42
+        sel = CFG["layout"] == key
+        if sel:
+            ell(PAD + 12, ry + 15, PAD + 24, ry + 27, fill=PC["accent"])
+            ell(PAD + 16.5, ry + 19.5, PAD + 19.5, ry + 22.5, fill=PC["white"])
+        else:
+            ell(PAD + 12, ry + 15, PAD + 24, ry + 27, fill=PC["white"],
+                outline=(154, 154, 154, 255))
+        txt(PAD + 30, ry + 7, name, 13)
+        txt(PAD + 30, ry + 25, desc, 11, False, PC["sub"])
+        if i:
+            line(PAD + 12, ry, W - PAD - 12, ry)
+        hit(PAD, ry, W - PAD, ry + 42, "layout", key)
+    y = card1 + 94 + 12
+
+    # --- 浮层缩放 ---
+    txt(PAD, y, "浮层缩放", 11, False, PC["hint"])
+    y += 15 + 6
+    gap = 5.0
+    bw = (W - 2 * PAD - 3 * gap) / 4.0
+    for i, v in enumerate((0.8, 1.0, 1.2, 1.5)):
+        bx = PAD + i * (bw + gap)
+        sel = abs(CFG["scale"] - v) < 0.01
+        rect(bx, y, bx + bw, y + 30, r=5,
+             fill=PC["accent_bg"] if sel else PC["white"],
+             outline=PC["accent"] if sel else PC["border"])
+        txt(bx + bw / 2, y + 15, "%.1f" % v, 12, False,
+            PC["accent"] if sel else PC["text"], "mm")
+        hit(bx, y, bx + bw, y + 30, "scale", v)
+    y += 30 + 12
+
+    # --- 显示位置：九宫格 + 边距 + 穿透 ---
+    txt(PAD, y, "显示位置", 11, False, PC["hint"])
+    y += 15 + 6
+    gx, gy = PAD, y
+    for i in range(9):
+        bx = gx + (i % 3) * 30
+        by = gy + (i // 3) * 24
+        sel = CFG["cell"] == i
+        rect(bx, by, bx + 26, by + 20, r=3,
+             fill=PC["accent_bg"] if sel else PC["white"],
+             outline=PC["accent"] if sel else PC["border"])
+        hit(bx, by, bx + 26, by + 20, "cell", i)
+
+    rx = gx + 26 * 3 + 8 * 2 + 16
+    txt(rx, gy + 3, "边距", 12)
+    rect(rx + 32, gy, rx + 54, gy + 20, r=3, fill=PC["white"], outline=PC["border"])
+    txt(rx + 43, gy + 10, "−", 13, False, PC["text"], "mm")
+    hit(rx + 32, gy, rx + 54, gy + 20, "margin", -5)
+    txt(rx + 72, gy + 10, "%d" % CFG["margin"], 12, False, PC["text"], "mm")
+    rect(rx + 90, gy, rx + 112, gy + 20, r=3, fill=PC["white"], outline=PC["border"])
+    txt(rx + 101, gy + 10, "+", 13, False, PC["text"], "mm")
+    hit(rx + 90, gy, rx + 112, gy + 20, "margin", 5)
+
+    # 点击穿透：开着 = 浮层不吃鼠标
+    through = not CFG["solid"]
+    ty = gy + 30
+    tx0, tx1 = rx, rx + 30
+    rect(tx0, ty, tx1, ty + 16, r=8, fill=PC["accent"] if through else PC["off"])
+    kx = tx1 - 14 if through else tx0 + 2
+    ell(kx, ty + 2, kx + 12, ty + 14, fill=PC["white"])
+    txt(rx + 38, ty + 8, "点击穿透", 12, False, PC["text"], "lm")
+    hit(tx0, ty - 2, rx + 98, ty + 18, "through")
+    y = gy + 24 * 3 + 12
+
+    # --- 反馈 ---
+    txt(PAD, y, "反馈", 11, False, PC["hint"])
+    y += 15 + 6
+    card2 = y
+    rect(PAD, card2, W - PAD, card2 + 110, r=6, fill=PC["card"], outline=PC["border"])
+    rows = (("wheel_on", "滚轮方向箭头", "wheel_hold", 0.15),
+            ("move_on", "鼠标移动箭头", "move_hold", 0.25),
+            ("bg", "深色底板", None, None))
+    vx = W - PAD - 12
+    for i, (flag, label, hkey, hstep) in enumerate(rows):
+        ry = card2 + 5 + i * 34
+        on = bool(CFG[flag])
+        ox0, ox1 = PAD + 12, PAD + 42
+        rect(ox0, ry + 9, ox1, ry + 25, r=8, fill=PC["accent"] if on else PC["off"])
+        kx = ox1 - 14 if on else ox0 + 2
+        ell(kx, ry + 11, kx + 12, ry + 23, fill=PC["white"])
+        txt(PAD + 50, ry + 17, label, 12, False, PC["text"], "lm")
+        hit(ox0, ry + 5, PAD + 46 + 70, ry + 29, flag)
+        if i:
+            line(PAD + 12, ry, W - PAD - 12, ry)
+        if hkey:
+            rect(vx - 22, ry + 7, vx, ry + 27, r=3, fill=PC["white"],
+                 outline=PC["border"])
+            txt(vx - 11, ry + 17, "+", 13, False, PC["text"], "mm")
+            hit(vx - 22, ry + 7, vx, ry + 27, hkey, hstep)
+            txt(vx - 42, ry + 17, "%.2fs" % CFG[hkey], 11, False, PC["sub"], "mm")
+            rect(vx - 84, ry + 7, vx - 62, ry + 27, r=3, fill=PC["white"],
+                 outline=PC["border"])
+            txt(vx - 73, ry + 17, "−", 13, False, PC["text"], "mm")
+            hit(vx - 84, ry + 7, vx - 62, ry + 27, hkey, -hstep)
+    y = card2 + 110 + 12
+
+    # --- 状态行 ---
+    vis = _TRAY["visible"]
+    state = "当前：%s · %.1f× · %s · %s" % (
+        LAYOUT_NAMES[CFG["layout"]], CFG["scale"],
+        CELL_SHORT[CFG["cell"]], "浮层显示中" if vis else "浮层已隐藏")
+    ell(PAD + 1, y + 5, PAD + 7, y + 11, fill=PC["ok"] if vis else PC["off"])
+    txt(PAD + 14, y + 8, state, 11, False, PC["sub"], "lm")
+    y += 16 + 10
+
+    # --- 底部按钮 ---
+    bw2 = (W - 2 * PAD - 8) / 2.0
+    rect(PAD, y, PAD + bw2, y + 34, r=5, fill=PC["btn"], outline=PC["btn_line"])
+    txt(PAD + bw2 / 2, y + 17, "隐藏浮层" if vis else "显示浮层", 12, False,
+        PC["text"], "mm")
+    hit(PAD, y, PAD + bw2, y + 34, "togglewin")
+    rect(PAD + bw2 + 8, y, W - PAD, y + 34, r=5, fill=PC["btn"],
+         outline=PC["btn_line"])
+    txt(PAD + bw2 + 8 + bw2 / 2, y + 17, "退出程序", 12, False, PC["danger"], "mm")
+    hit(PAD + bw2 + 8, y, W - PAD, y + 34, "quit")
+    y += 34 + 14
+    return it, y, hits
+
+
+def panel_scale_for(h):
+    """面板按系统 DPI 放大；屏幕太矮时整体缩一档，保证整块放得下。"""
+    try:
+        hdc = user32.GetDC(None)
+        dpi = gdi32.GetDeviceCaps(hdc, 88)      # LOGPIXELSX
+        user32.ReleaseDC(None, hdc)
+        s = max(1.0, dpi / 96.0)
+    except Exception:
+        s = 1.0
+    mons = list_monitors()
+    if mons:
+        sh = mons[0][3]
+        if h * s > sh * 0.86:
+            s = max(0.78, sh * 0.86 / h)
+    return s
+
+
+def _panel_draw_img(items, h, s):
+    """把指令画成一张 RGBA 图（先按 s*超采样 画，再缩小）。
+
+    超采样总倍率封顶 4：高 DPI 下 s 本身就有 2 以上，再乘 3 会让绘制量翻四倍，
+    点一下要等两百多毫秒。4 倍已经看不出锯齿了。
+    """
+    ss = min(PANEL_SS * s, 4.0)
+    W = PANEL_W
+    im = Image.new("RGBA", (max(1, int(round(W * ss))), max(1, int(round(h * ss)))),
+                   (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+
+    def B(b):
+        return [b[0] * ss, b[1] * ss, b[2] * ss, b[3] * ss]
+
+    for item in items:
+        kind = item[0]
+        if kind == "rect":
+            _, box, r, fill, outline, w = item
+            d.rounded_rectangle(B(box), radius=max(0, r) * ss, fill=fill,
+                                outline=outline, width=max(1, int(round(w * ss))))
+        elif kind == "ellipse":
+            _, box, fill, outline, w = item
+            d.ellipse(B(box), fill=fill, outline=outline,
+                      width=max(1, int(round(w * ss))))
+        elif kind == "line":
+            _, box, fill, w = item
+            d.line(B(box), fill=fill, width=max(1, int(round(w * ss))))
+        elif kind == "text":
+            _, (x, y), s_text, size, bold, fill, anchor = item
+            d.text((x * ss, y * ss), s_text, font=pfont(max(8, int(round(size * ss))), bold),
+                   fill=fill, anchor=anchor)
+
+    # 圆角裁剪
+    mask = Image.new("L", im.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        [0, 0, im.width - 1, im.height - 1], radius=int(8 * ss), fill=255)
+    im.putalpha(mask)
+
+    out = im.resize((max(1, int(round(W * s))), max(1, int(round(h * s)))),
+                    Image.LANCZOS)
+    return _panel_shadow(out)
+
+
+def _panel_shadow(im):
+    """面板自己的投影：比浮层那套更宽更淡，看起来才像一扇窗口。"""
+    m = PANEL_PAD
+    canvas = Image.new("RGBA", (im.width + 2 * m, im.height + 2 * m), (0, 0, 0, 0))
+    alpha = im.getchannel("A").point(lambda v: int(v * 0.42))
+    sh = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    sh.putalpha(alpha)
+    sh = sh.filter(ImageFilter.GaussianBlur(7))
+    canvas.alpha_composite(sh, (m, m + 3))
+    canvas.alpha_composite(im, (m, m))
+    return canvas
+
+
+def panel_redraw():
+    """重画面板并贴上去。面板没开就什么都不做。"""
+    hwnd = PANEL["hwnd"]
+    if not hwnd or not PANEL["visible"]:
+        return
+    try:
+        items, h, hits = panel_layout()
+        s = PANEL["scale"] or panel_scale_for(h)
+        im = _panel_draw_img(items, h, s)
+        PANEL["hits"] = hits
+        PANEL["items_h"] = h
+        px, py = PANEL["pos"]
+        blit(hwnd, im, int(px - PANEL_PAD), int(py - PANEL_PAD))
+    except Exception:
+        _log_exc()
+
+
+def panel_hit(mx, my):
+    """mx/my 是窗口内物理像素；扣掉阴影留白后换算回逻辑坐标再查表。"""
+    s = PANEL["scale"] or 1.0
+    lx = (mx - PANEL_PAD) / s
+    ly = (my - PANEL_PAD) / s
+    for x0, y0, x1, y1, act, arg in PANEL["hits"]:
+        if x0 <= lx < x1 and y0 <= ly < y1:
+            return act, arg
+    return None, None
+
+
+def panel_action(act, arg):
+    if act == "drag":
+        return
+    if act == "close":
+        panel_hide()
+        return
+    if act == "togglewin":
+        CMD["toggle"] = True
+        return
+    if act == "quit":
+        CMD["quit"] = True
+        return
+
+    need_repaint = True
+    if act == "layout":
+        reload_art(arg)
+    elif act == "scale":
+        CFG["scale"] = arg
+    elif act == "cell":
+        CFG["cell"] = arg
+        CFG["pinned"] = False      # 面板里选了格位，就别再守着 --pos 的固定坐标
+    elif act == "margin":
+        CFG["margin"] = max(0, min(400, CFG["margin"] + arg))
+        CFG["pinned"] = False
+    elif act == "through":
+        CFG["solid"] = not CFG["solid"]
+    elif act in ("wheel_on", "move_on", "bg"):
+        CFG[act] = not CFG[act]
+    elif act in ("wheel_hold", "move_hold"):
+        CFG[act] = round(max(0.05, min(1.5, CFG[act] + arg)), 2)
+    else:
+        need_repaint = False
+
+    if need_repaint:
+        cfg_save()
+        CMD["repaint"] = True
+    panel_redraw()
+
+
+def _panel_wndproc(hwnd, msg, wparam, lparam):
+    if msg == WM_LBUTTONDOWN:
+        mx = ctypes.c_short(lparam & 0xFFFF).value
+        my = ctypes.c_short((lparam >> 16) & 0xFFFF).value
+        act, arg = panel_hit(mx, my)
+        if act == "drag":
+            PANEL["drag"] = get_cursor()
+            user32.SetCapture(hwnd)
+        elif act:
+            panel_action(act, arg)
+        return 0
+    if msg == WM_MOUSEMOVE and PANEL["drag"]:
+        cx, cy = get_cursor()
+        dx, dy = cx - PANEL["drag"][0], cy - PANEL["drag"][1]
+        PANEL["drag"] = (cx, cy)
+        px, py = PANEL["pos"]
+        PANEL["pos"] = (px + dx, py + dy)
+        user32.SetWindowPos(hwnd, None, int(px + dx - PANEL_PAD),
+                            int(py + dy - PANEL_PAD), 0, 0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+        return 0
+    if msg == WM_LBUTTONUP:
+        if PANEL["drag"]:
+            PANEL["drag"] = None
+            user32.ReleaseCapture()
+        return 0
+    if msg == 0x0010:              # WM_CLOSE -> 只是关面板，不退出程序
+        panel_hide()
+        return 0
+    return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+_panel_proc_ref = []
+
+
+def create_panel_window():
+    hinst = kernel32.GetModuleHandleW(None)
+    proc = WNDPROC(_panel_wndproc)
+    _panel_proc_ref.append(proc)
+    wc = WNDCLASSEXW()
+    wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
+    wc.lpfnWndProc = proc
+    wc.hInstance = hinst
+    wc.hCursor = user32.LoadCursorW(None, 32512)
+    wc.lpszClassName = PANEL_CLASS
+    user32.RegisterClassExW(ctypes.byref(wc))
+    # 不加 WS_EX_TRANSPARENT（要收点击），也不加 WS_EX_APPWINDOW（不进任务栏）
+    ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+    hwnd = user32.CreateWindowExW(ex, PANEL_CLASS, "KeyOverlay 控制面板", WS_POPUP,
+                                  0, 0, 10, 10, None, None, hinst, None)
+    PANEL["hwnd"] = hwnd
+    return hwnd
+
+
+def panel_show():
+    hwnd = PANEL["hwnd"] or create_panel_window()
+    if not hwnd:
+        return
+    items, h, hits = panel_layout()
+    s = panel_scale_for(h)
+    PANEL["scale"] = s
+    mons = list_monitors()
+    sx, sy, sw, sh = mons[min(CFG["mon"], len(mons) - 1)]
+    pw, ph = PANEL_W * s, h * s
+    PANEL["pos"] = (int(sx + (sw - pw) / 2), int(sy + (sh - ph) / 2))
+    PANEL["visible"] = True
+    user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+    panel_redraw()
+    panel_topmost()
+
+
+def panel_hide():
+    if PANEL["hwnd"]:
+        user32.ShowWindow(PANEL["hwnd"], 0)
+    PANEL["visible"] = False
+    PANEL["drag"] = None
+
+
+def panel_toggle():
+    panel_hide() if PANEL["visible"] else panel_show()
+
+
+def panel_topmost():
+    if PANEL["hwnd"]:
+        user32.SetWindowPos(PANEL["hwnd"], ctypes.c_void_p(HWND_TOPMOST), 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
+
+GWL_EXSTYLE = -20
+user32.GetWindowLongW.restype = ctypes.c_long
+user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.SetWindowLongW.restype = ctypes.c_long
+user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+
+
+def apply_solid(hwnd, solid):
+    """点击穿透开关：加/去掉 WS_EX_TRANSPARENT，面板里一改就生效。"""
+    try:
+        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        new = (ex & ~WS_EX_TRANSPARENT) if solid else (ex | WS_EX_TRANSPARENT)
+        if new != ex:
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new)
+    except Exception:
+        _log_exc()
 
 
 # ============================ 主流程 ============================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pos", default=None, help="左上角坐标 x,y（默认左下角）")
-    ap.add_argument("--margin", type=int, default=40)
-    ap.add_argument("--scale", type=float, default=1.2)
-    ap.add_argument("--bg", action="store_true", help="连 SVG 的黑色底板一起画")
-    ap.add_argument("--mouse-yellow", action="store_true", help="鼠标左右键常亮黄色")
-    ap.add_argument("--solid", action="store_true", help="取消点击穿透")
+    ap.add_argument("--pos", default=None, help="左上角坐标 x,y（覆盖配置文件里的格位）")
+    ap.add_argument("--layout", default=argparse.SUPPRESS, choices=("classic", "extended"),
+                    help="布局：classic=原版 9 键，extended=25 键（默认）")
+    ap.add_argument("--margin", type=int, default=argparse.SUPPRESS)
+    ap.add_argument("--scale", type=float, default=argparse.SUPPRESS)
+    ap.add_argument("--bg", action="store_true", default=argparse.SUPPRESS,
+                    help="连 SVG 的黑色底板一起画")
+    ap.add_argument("--mouse-yellow", action="store_true", default=argparse.SUPPRESS,
+                    help="鼠标左右键常亮黄色")
+    ap.add_argument("--solid", action="store_true", default=argparse.SUPPRESS,
+                    help="取消点击穿透")
     ap.add_argument("--preview", default=None, help="只渲染一张静态图到指定路径")
     ap.add_argument("--pressed", default="W,LMB", help="预览时高亮的键，逗号分隔")
-    ap.add_argument("--hold", type=float, default=0.03,
+    ap.add_argument("--hold", type=float, default=argparse.SUPPRESS,
                     help="按下后至少点亮多久（秒）。调小=连点更容易分成两下，调大=更快的手点也能看清")
     ap.add_argument("--no-tray", action="store_true", help="不创建系统托盘图标")
     ap.add_argument("--debug", action="store_true", help="把状态变化写进 keyoverlay.log，排查连点用")
     ap.add_argument("--poll", type=float, default=0.006,
                     help="轮询间隔（秒），默认 0.006")
-    ap.add_argument("--wheel-hold", type=float, default=0.15,
+    ap.add_argument("--wheel-hold", type=float, default=argparse.SUPPRESS,
                     help="滚轮滚动后至少点亮多久（秒）。滚动是瞬时事件，比 --hold 长才看得清")
-    ap.add_argument("--no-wheel", action="store_true",
+    ap.add_argument("--no-wheel", action="store_true", default=argparse.SUPPRESS,
                     help="不采集滚轮滚动（不注册 Raw Input，零开销）")
-    ap.add_argument("--move-hold", type=float, default=0.25,
+    ap.add_argument("--move-hold", type=float, default=argparse.SUPPRESS,
                     help="鼠标停止后方向箭头再保留多久（秒），默认 0.25")
-    ap.add_argument("--no-move", action="store_true",
+    ap.add_argument("--no-move", action="store_true", default=argparse.SUPPRESS,
                     help="不显示鼠标移动方向箭头")
     ap.add_argument("--move-deg", type=float, default=None,
                     help="预览时移动箭头的角度（0=向右，90=向上，180=向左，270=向下）")
@@ -1141,16 +1713,43 @@ def main():
                     help="退出热键的虚拟键码，可写多个（默认 0x79,0x7A = F10 或 F11；0x7A 其实是 F11）")
     args = ap.parse_args()
 
+    # 配置优先级：内置默认 < keyoverlay.ini < 命令行显式参数
+    cfg_load()
+    if hasattr(args, "layout"):
+        CFG["layout"] = args.layout
+    if hasattr(args, "scale"):
+        CFG["scale"] = args.scale
+    if hasattr(args, "margin"):
+        CFG["margin"] = args.margin
+    if hasattr(args, "hold"):
+        CFG["hold"] = args.hold
+    if hasattr(args, "wheel_hold"):
+        CFG["wheel_hold"] = args.wheel_hold
+    if hasattr(args, "move_hold"):
+        CFG["move_hold"] = args.move_hold
+    if getattr(args, "bg", False):
+        CFG["bg"] = True
+    if getattr(args, "mouse_yellow", False):
+        CFG["mouse_yellow"] = True
+    if getattr(args, "solid", False):
+        CFG["solid"] = True
+    if getattr(args, "no_wheel", False):
+        CFG["wheel_on"] = False
+    if getattr(args, "no_move", False):
+        CFG["move_on"] = False
+    cfg_clamp()
+
     if args.preview:
+        reload_art(CFG["layout"])
         hit = tuple(v.strip().upper() for v in args.pressed.split(",") if v.strip())
         mv = -1 if args.move_deg is None else \
             int(round(args.move_deg / (360.0 / MOVE_DIRS))) % MOVE_DIRS
-        im = render(pressed=hit, scale=args.scale, bg=args.bg,
-                    mouse_yellow=args.mouse_yellow, move=mv)
+        im = render(pressed=hit, scale=CFG["scale"], bg=CFG["bg"],
+                    mouse_yellow=CFG["mouse_yellow"], move=mv)
         bg = Image.new("RGBA", im.size, (32, 38, 52, 255))
         bg.alpha_composite(im)
         bg.convert("RGB").save(args.preview)
-        print("已生成预览:", args.preview, im.size)
+        print("已生成预览:", args.preview, im.size, LAYOUT_NAMES[CFG["layout"]])
         return 0
 
     try:
@@ -1168,26 +1767,29 @@ def main():
             if not user32.FindWindowW(CLASS_NAME, None):
                 break
 
-    img = render(scale=args.scale, bg=args.bg, mouse_yellow=args.mouse_yellow)
+    reload_art(CFG["layout"])
+    img = render(scale=CFG["scale"], bg=CFG["bg"], mouse_yellow=CFG["mouse_yellow"])
     w, h = img.size
     pad = SHADOW_MARGIN if SHADOW else 0
     if args.pos:
+        CFG["pinned"] = True        # 钉死了位置，之后重绘就不再按格位回位
         x, y = [int(v) for v in args.pos.split(",")]
         x -= pad
         y -= pad
     else:
-        cfg_load()
         mons = list_monitors()
-        sc = mons[min(_POS["mon"], len(mons) - 1)]
-        cx, cy = anchor_xy(_POS["cell"], w - 2 * pad, h - 2 * pad, sc, args.margin)
+        sc = mons[min(CFG["mon"], len(mons) - 1)]
+        cx, cy = anchor_xy(CFG["cell"], w - 2 * pad, h - 2 * pad, sc, CFG["margin"])
         x, y = cx - pad, cy - pad
 
-    hwnd = create_window(w, h, x, y, clickthrough=not args.solid)
+    hwnd = create_window(w, h, x, y, clickthrough=not CFG["solid"])
     if not hwnd:
         print("创建窗口失败，错误码:", ctypes.get_last_error())
         return 1
 
-    wheel_on = False if args.no_wheel else enable_wheel(hwnd)
+    # 这里只决定要不要注册 Raw Input（--no-wheel 才真正不注册）；显不显示看 CFG["wheel_on"]，
+    # 面板里随时能开回来，所以不能因为 ini 里关过就干脆不注册
+    wheel_on = False if getattr(args, "no_wheel", False) else enable_wheel(hwnd)
 
     blit(hwnd, img, x, y)
 
@@ -1202,11 +1804,7 @@ def main():
     prev_state = frozenset()
     last_top = 0.0
     last_seen = {}          # 名称 -> 最后按下的时刻，实现最短显示时长
-    MIN_HOLD = max(0.02, args.hold)
-    WHEEL_HOLD = max(0.02, args.wheel_hold)
     POLL = max(0.002, args.poll)
-    move_on = not args.no_move
-    MOVE_HOLD = max(0.02, args.move_hold)
     MIN_DRAW_GAP = 0.02     # 仅方向变化时至少间隔这么久再重绘（别把 6ms 轮询拖死）
     prev_move = -1
     last_draw = 0.0
@@ -1217,7 +1815,18 @@ def main():
     quit_vks = [int(v, 0) for v in str(args.quit_vk).split(",") if v.strip()]
     prev_f9 = prev_f10 = False
     visible = True
-    print("已启动：%dx%d @ (%d,%d)   F9 隐藏/显示，F10 退出" % (w, h, x, y))
+
+    def place():
+        """按 CFG 里的格位算出窗口左上角（已含阴影留白的偏移）。"""
+        mons = list_monitors()
+        if CFG["mon"] >= len(mons):
+            CFG["mon"] = 0
+        sc = mons[CFG["mon"]]
+        cx, cy = anchor_xy(CFG["cell"], w - 2 * pad, h - 2 * pad, sc, CFG["margin"])
+        return cx - pad, cy - pad
+
+    print("已启动：%s · %dx%d @ (%d,%d)   F9 隐藏/显示，F10 退出"
+          % (LAYOUT_NAMES[CFG["layout"]], w, h, x, y))
     print("滚轮反馈：%s" % ("已启用（Raw Input 只读，不拦截）" if wheel_on else "未启用"))
 
     try:
@@ -1227,6 +1836,9 @@ def main():
             if h_event and kernel32.WaitForSingleObject(h_event, 0) == 0:
                 break
             now = time.time()
+            hold = max(0.02, CFG["hold"])
+            wheel_hold = max(0.05, CFG["wheel_hold"])
+            move_hold = max(0.05, CFG["move_hold"])
             cur = get_cursor()
             mdx, mdy = cur[0] - last_cursor[0], cur[1] - last_cursor[1]
             last_cursor = cur
@@ -1236,7 +1848,7 @@ def main():
                 _MOVE["dy"] = _MOVE["dy"] * MOVE_DECAY + mdy
                 _MOVE["t"] = now
             move = -1
-            if move_on and now - _MOVE["t"] < MOVE_HOLD and \
+            if CFG["move_on"] and now - _MOVE["t"] < move_hold and \
                     abs(_MOVE["dx"]) + abs(_MOVE["dy"]) >= MOVE_MIN:
                 deg = math.degrees(math.atan2(-_MOVE["dy"], _MOVE["dx"]))
                 move = int(round(deg / (360.0 / MOVE_DIRS))) % MOVE_DIRS
@@ -1245,8 +1857,8 @@ def main():
             down |= {b[0] for b in MOUSE_BTNS if is_down(b[1])}
             for n in down:
                 last_seen[n] = now
-            state = frozenset(n for n, t in last_seen.items() if now - t < MIN_HOLD)
-            if wheel_on and now - _WHEEL["t"] < WHEEL_HOLD:
+            state = frozenset(n for n, t in last_seen.items() if now - t < hold)
+            if CFG["wheel_on"] and wheel_on and now - _WHEEL["t"] < wheel_hold:
                 state = state | {"WHEEL_UP" if _WHEEL["dir"] > 0 else "WHEEL_DOWN"}
 
             changed = state != prev_state
@@ -1257,8 +1869,8 @@ def main():
                     dbg_f.flush()
                 if visible:
                     try:
-                        img = render(pressed=state, scale=args.scale, bg=args.bg,
-                                     mouse_yellow=args.mouse_yellow, move=move)
+                        img = render(pressed=state, scale=CFG["scale"], bg=CFG["bg"],
+                                     mouse_yellow=CFG["mouse_yellow"], move=move)
                     except Exception:
                         _log_exc()
                         img = None
@@ -1275,14 +1887,38 @@ def main():
             if CMD["quit"]:
                 CMD["quit"] = False
                 break
+
+            # 面板里改过设置：重渲染 + 按格位重定位（尺寸可能变了）
+            if CMD["repaint"]:
+                CMD["repaint"] = False
+                try:
+                    apply_solid(hwnd, CFG["solid"])
+                    img = render(pressed=prev_state, scale=CFG["scale"], bg=CFG["bg"],
+                                 mouse_yellow=CFG["mouse_yellow"],
+                                 move=prev_move if CFG["move_on"] else -1)
+                    w, h = img.size
+                    if not CFG["pinned"]:
+                        x, y = place()
+                    user32.SetWindowPos(hwnd, None, x, y, w, h,
+                                        SWP_NOZORDER | SWP_NOACTIVATE)
+                    if visible:
+                        blit(hwnd, img, x, y)
+                    print("设置已应用：%s · %.1f× · %s · %dpx → (%d,%d)"
+                          % (LAYOUT_NAMES[CFG["layout"]], CFG["scale"],
+                             CELL_SHORT[CFG["cell"]], CFG["margin"], x, y))
+                except Exception:
+                    _log_exc()
+                if PANEL["visible"]:
+                    panel_redraw()
+
             if CMD["reload"]:
                 CMD["reload"] = False
                 try:
                     reload_art()
                 except Exception:
                     _log_exc()
-                img = render(pressed=prev_state, scale=args.scale,
-                             bg=args.bg, mouse_yellow=args.mouse_yellow)
+                img = render(pressed=prev_state, scale=CFG["scale"],
+                             bg=CFG["bg"], mouse_yellow=CFG["mouse_yellow"])
                 if img.size != (w, h):
                     w, h = img.size
                     user32.SetWindowPos(hwnd, None, x, y, w, h,
@@ -1292,21 +1928,24 @@ def main():
             if CMD["anchor"]:
                 CMD["anchor"] = False
                 try:
-                    mons = list_monitors()
-                    if _POS["mon"] >= len(mons):
-                        _POS["mon"] = 0
-                    sc = mons[_POS["mon"]]
-                    cx, cy = anchor_xy(_POS["cell"], w - 2 * pad, h - 2 * pad,
-                                       sc, args.margin)
-                    x, y = cx - pad, cy - pad
+                    x, y = place()
                     user32.SetWindowPos(hwnd, None, x, y, w, h,
                                         SWP_NOZORDER | SWP_NOACTIVATE)
                     if visible:
                         blit(hwnd, img, x, y)
                     print("浮层位置：%s · 显示器%d → (%d,%d)"
-                          % (CELL_NAMES[_POS["cell"]], _POS["mon"] + 1, x, y))
+                          % (CELL_NAMES[CFG["cell"]], CFG["mon"] + 1, x, y))
                 except Exception:
                     _log_exc()
+
+            if CMD["panel"]:
+                CMD["panel"] = False
+                panel_toggle()
+
+            # 托盘单击延时一拍：确认不是双击再切显示/隐藏
+            if _TRAY["click_t"] and now - _TRAY["click_t"] > 0.28:
+                _TRAY["click_t"] = 0.0
+                CMD["toggle"] = True
 
             toggle_req = CMD["toggle"]
             CMD["toggle"] = False
@@ -1318,9 +1957,11 @@ def main():
                 user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE if visible else 0)
                 if visible:
                     blit(hwnd, img, x, y)
-                tray_set_tip("键鼠显示（显示中）· 左键单击隐藏 · 右键菜单" if visible
-                             else "键鼠显示（已隐藏）· 左键单击显示 · 右键菜单")
+                tray_set_tip("键鼠显示（显示中）· 单击隐藏 · 双击控制面板 · 右键菜单" if visible
+                             else "键鼠显示（已隐藏）· 单击显示 · 双击控制面板 · 右键菜单")
                 print("显示" if visible else "隐藏")
+                if PANEL["visible"]:
+                    panel_redraw()
             if f10 and not prev_f10:
                 print("退出")
                 break
@@ -1330,6 +1971,7 @@ def main():
             if now - last_top > TOPMOST_REFRESH:
                 user32.SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), 0, 0, 0, 0,
                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+                panel_topmost()
                 last_top = now
             time.sleep(POLL)
     except KeyboardInterrupt:
@@ -1339,6 +1981,11 @@ def main():
             tray_remove()
         except Exception:
             pass
+        if PANEL["hwnd"]:
+            try:
+                user32.DestroyWindow(PANEL["hwnd"])
+            except Exception:
+                pass
         user32.DestroyWindow(hwnd)
     return 0
 
