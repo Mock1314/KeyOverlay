@@ -1148,7 +1148,7 @@ def _tray_wndproc(hwnd, msg, wparam, lparam):
         elif lparam == WM_LBUTTONDBLCLK:
             # 双击开控制面板；顺手把单击计时清掉，别让双击再顺带切一次显隐
             _TRAY["click_t"] = 0.0
-            _TRAY["skip_until"] = time.time() + 0.45
+            _TRAY["skip_until"] = time.time() + 0.8
             CMD["panel"] = True
         elif lparam == WM_LBUTTONUP:
             if time.time() >= _TRAY.get("skip_until", 0.0):
