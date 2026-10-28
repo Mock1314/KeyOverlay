@@ -806,12 +806,97 @@ WM_COMMAND = 0x0111
 WM_LBUTTONUP, WM_RBUTTONUP, WM_LBUTTONDBLCLK, WM_CONTEXTMENU = 0x0202, 0x0205, 0x0203, 0x007B
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
-MF_STRING, MF_SEPARATOR, MF_CHECKED = 0x0000, 0x0800, 0x0008
+MF_STRING, MF_SEPARATOR, MF_CHECKED, MF_POPUP = 0x0000, 0x0800, 0x0008, 0x0010
 TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_NONOTIFY = 0x0100, 0x0002, 0x0080
 ID_TOGGLE, ID_RELOAD, ID_QUIT = 1001, 1002, 1003
+ID_POS_BASE, ID_MON_BASE = 1100, 1120     # 九宫格格位 1100..1108，显示器 1120..112F
 
-CMD = {"toggle": False, "reload": False, "quit": False}
+CMD = {"toggle": False, "reload": False, "quit": False, "anchor": False}
 _TRAY = {"hwnd": None, "hicon": None, "icon": None, "on": False, "visible": True}
+
+# 浮层位置状态：cell 是九宫格格位（0..8，按行优先），mon 是显示器序号（0 = 主屏）
+_POS = {"cell": 6, "mon": 0}              # 6 = 左下，与原默认一致
+CELL_NAMES = ("↖ 左上", "↑ 上中", "↗ 右上",
+              "← 左中", "● 居中", "→ 右中",
+              "↙ 左下", "↓ 下中", "↘ 右下")
+CFG_FILE = os.path.join(HERE, "keyoverlay.ini")
+
+
+# ---- 显示器枚举 --------------------------------------------------------------
+class RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", RECT),
+                ("rcWork", RECT), ("dwFlags", wintypes.DWORD)]
+
+
+MONITORENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, ctypes.c_void_p, wintypes.HDC,
+                                     ctypes.POINTER(RECT), wintypes.LPARAM)
+user32.EnumDisplayMonitors.argtypes = [wintypes.HDC, ctypes.c_void_p,
+                                       MONITORENUMPROC, wintypes.LPARAM]
+user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+
+
+def list_monitors():
+    """返回 [(left, top, width, height), ...]，主屏永远排第一，其余按左边界排序。"""
+    found = []
+
+    def _cb(hmon, hdc, lprc, data):
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            r = mi.rcMonitor
+            found.append((1 if (mi.dwFlags & 1) else 0, r.left, r.top,
+                          r.right - r.left, r.bottom - r.top))
+        return True
+
+    try:
+        user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(_cb), 0)
+    except Exception:
+        _log_exc()
+    if not found:
+        return [(0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))]
+    found.sort(key=lambda m: (-m[0], m[1], m[2]))     # 主屏优先，再按位置
+    return [m[1:] for m in found]
+
+
+def anchor_xy(cell, cw, ch, screen, margin):
+    """九宫格第 cell 格的"内容左上角"坐标。cw/ch 是内容尺寸，不含阴影留白。"""
+    sx, sy, sw, sh = screen
+    col, row = cell % 3, cell // 3
+    dx = (margin if col == 0 else
+          (sw - cw) // 2 if col == 1 else sw - cw - margin)
+    dy = (margin if row == 0 else
+          (sh - ch) // 2 if row == 1 else sh - ch - margin)
+    return int(sx + dx), int(sy + dy)
+
+
+def cfg_load():
+    """读 keyoverlay.ini；文件不存在或读坏了就用默认值。"""
+    try:
+        with open(CFG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                k, sep, v = line.partition("=")
+                k = k.strip().lower()
+                if sep and k in _POS:
+                    _POS[k] = int(v.strip())
+    except Exception:
+        pass
+    _POS["cell"] = max(0, min(8, int(_POS.get("cell", 6))))
+    _POS["mon"] = max(0, int(_POS.get("mon", 0)))
+    return _POS
+
+
+def cfg_save():
+    try:
+        with open(CFG_FILE, "w", encoding="utf-8") as f:
+            f.write("# KeyOverlay 设置（托盘菜单里改，一般不用手改）\n")
+            f.write("cell=%d\nmon=%d\n" % (_POS["cell"], _POS["mon"]))
+    except Exception:
+        pass          # 放在只读目录时就不记了，不影响使用
 
 
 class NOTIFYICONDATAW(ctypes.Structure):
@@ -914,13 +999,58 @@ def tray_remove():
     d["on"] = False
 
 
-def show_tray_menu(hwnd):
+def _build_menu():
     menu = user32.CreatePopupMenu()
-    flags = MF_STRING | (0 if _TRAY["visible"] else MF_CHECKED)
-    user32.AppendMenuW(menu, MF_STRING, ID_TOGGLE, "隐藏浮层" if _TRAY["visible"] else "显示浮层")
+    user32.AppendMenuW(menu, MF_STRING, ID_TOGGLE,
+                       "隐藏浮层" if _TRAY["visible"] else "显示浮层")
     user32.AppendMenuW(menu, MF_STRING, ID_RELOAD, "重新加载设计稿 (svg)")
     user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+
+    # --- 浮层位置：九宫格 + （多屏时）显示器选择 ---
+    posmenu = user32.CreatePopupMenu()
+    subs = [posmenu]
+    for i, name in enumerate(CELL_NAMES):
+        fl = MF_STRING | (MF_CHECKED if _POS["cell"] == i else 0)
+        user32.AppendMenuW(posmenu, fl, ID_POS_BASE + i, name)
+    try:
+        mons = list_monitors()
+    except Exception:
+        mons = []
+    if len(mons) > 1:
+        user32.AppendMenuW(posmenu, MF_SEPARATOR, 0, None)
+        monmenu = user32.CreatePopupMenu()
+        subs.append(monmenu)
+        for i in range(len(mons)):
+            fl = MF_STRING | (MF_CHECKED if _POS["mon"] == i else 0)
+            user32.AppendMenuW(monmenu, fl, ID_MON_BASE + i, "显示器 %d" % (i + 1))
+        user32.AppendMenuW(posmenu, MF_POPUP, monmenu, "放在哪个屏幕")
+    user32.AppendMenuW(menu, MF_POPUP, posmenu, "浮层位置")
+
+    user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
     user32.AppendMenuW(menu, MF_STRING, ID_QUIT, "退出")
+    return menu, subs
+
+
+def _menu_cmd(cmd):
+    """菜单命令统一分发（弹菜单和 WM_COMMAND 两条路径共用）。"""
+    if cmd == ID_TOGGLE:
+        CMD["toggle"] = True
+    elif cmd == ID_RELOAD:
+        CMD["reload"] = True
+    elif cmd == ID_QUIT:
+        CMD["quit"] = True
+    elif ID_POS_BASE <= cmd < ID_POS_BASE + 9:
+        _POS["cell"] = cmd - ID_POS_BASE
+        cfg_save()
+        CMD["anchor"] = True
+    elif ID_MON_BASE <= cmd < ID_MON_BASE + 16:
+        _POS["mon"] = cmd - ID_MON_BASE
+        cfg_save()
+        CMD["anchor"] = True
+
+
+def show_tray_menu(hwnd):
+    menu, subs = _build_menu()
     pt = POINT()
     user32.GetCursorPos(ctypes.byref(pt))
     user32.SetForegroundWindow(hwnd)      # 否则点菜单外面不会自动关
@@ -928,12 +1058,10 @@ def show_tray_menu(hwnd):
                                 pt.x, pt.y, 0, hwnd, None)
     user32.PostMessageW(hwnd, 0x0000, 0, 0)
     user32.DestroyMenu(menu)
-    if cmd == ID_TOGGLE:
-        CMD["toggle"] = True
-    elif cmd == ID_RELOAD:
-        CMD["reload"] = True
-    elif cmd == ID_QUIT:
-        CMD["quit"] = True
+    for m in subs:                        # 子菜单是独立 HMENU，不单独销毁会漏 GDI 句柄
+        user32.DestroyMenu(m)
+    if cmd:
+        _menu_cmd(cmd)
 
 
 def _tray_wndproc(hwnd, msg, wparam, lparam):
@@ -944,13 +1072,7 @@ def _tray_wndproc(hwnd, msg, wparam, lparam):
             CMD["toggle"] = True
         return 0
     if msg == WM_COMMAND:
-        rid = wparam & 0xFFFF
-        if rid == ID_TOGGLE:
-            CMD["toggle"] = True
-        elif rid == ID_RELOAD:
-            CMD["reload"] = True
-        elif rid == ID_QUIT:
-            CMD["quit"] = True
+        _menu_cmd(wparam & 0xFFFF)
         return 0
     if msg in (0x0010, 0x0002):        # WM_CLOSE / WM_DESTROY
         return 0                        # 托盘窗口不许被关掉
@@ -1048,15 +1170,17 @@ def main():
 
     img = render(scale=args.scale, bg=args.bg, mouse_yellow=args.mouse_yellow)
     w, h = img.size
-    sw = user32.GetSystemMetrics(0)
-    sh = user32.GetSystemMetrics(1)
+    pad = SHADOW_MARGIN if SHADOW else 0
     if args.pos:
         x, y = [int(v) for v in args.pos.split(",")]
+        x -= pad
+        y -= pad
     else:
-        x, y = args.margin, sh - h - args.margin
-    if SHADOW:
-        x -= SHADOW_MARGIN
-        y -= SHADOW_MARGIN
+        cfg_load()
+        mons = list_monitors()
+        sc = mons[min(_POS["mon"], len(mons) - 1)]
+        cx, cy = anchor_xy(_POS["cell"], w - 2 * pad, h - 2 * pad, sc, args.margin)
+        x, y = cx - pad, cy - pad
 
     hwnd = create_window(w, h, x, y, clickthrough=not args.solid)
     if not hwnd:
@@ -1164,6 +1288,25 @@ def main():
                     user32.SetWindowPos(hwnd, None, x, y, w, h,
                                         SWP_NOZORDER | SWP_NOACTIVATE)
                 blit(hwnd, img, x, y)
+
+            if CMD["anchor"]:
+                CMD["anchor"] = False
+                try:
+                    mons = list_monitors()
+                    if _POS["mon"] >= len(mons):
+                        _POS["mon"] = 0
+                    sc = mons[_POS["mon"]]
+                    cx, cy = anchor_xy(_POS["cell"], w - 2 * pad, h - 2 * pad,
+                                       sc, args.margin)
+                    x, y = cx - pad, cy - pad
+                    user32.SetWindowPos(hwnd, None, x, y, w, h,
+                                        SWP_NOZORDER | SWP_NOACTIVATE)
+                    if visible:
+                        blit(hwnd, img, x, y)
+                    print("浮层位置：%s · 显示器%d → (%d,%d)"
+                          % (CELL_NAMES[_POS["cell"]], _POS["mon"] + 1, x, y))
+                except Exception:
+                    _log_exc()
 
             toggle_req = CMD["toggle"]
             CMD["toggle"] = False

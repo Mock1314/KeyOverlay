@@ -13,6 +13,7 @@ env/
 # --- 运行时产物 ---
 *.log
 keyoverlay.log
+keyoverlay.ini
 stop_debug.txt
 
 # --- 编辑器 / 系统 ---
